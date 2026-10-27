@@ -52,6 +52,7 @@ import io.milvus.v2.common.IndexParam;
 import io.milvus.v2.service.collection.request.AddFieldReq;
 import io.milvus.v2.service.collection.request.CreateCollectionReq;
 import io.milvus.v2.service.collection.request.DropCollectionReq;
+import io.milvus.v2.service.collection.request.GetCollectionStatsReq;
 import io.milvus.v2.service.collection.request.HasCollectionReq;
 import io.milvus.v2.service.vector.request.InsertReq;
 import io.milvus.v2.service.vector.request.SearchReq;
@@ -60,7 +61,15 @@ import io.milvus.v2.service.vector.response.SearchResp;
 
 public class App {
 
-    static MilvusContainer milvus = new MilvusContainer("milvusdb/milvus:v2.5.4");
+    static MilvusContainer milvus = new MilvusContainer("milvusdb/milvus:v2.5.4").withReuse(true);
+
+    // Reused container keeps its data between runs: skip re-embedding if the collection is already filled.
+    // shortcut: no check that chunking/model params match the stored data, drop the container when they change.
+    static boolean hasData(MilvusClientV2 client, String collection) {
+        return client.hasCollection(HasCollectionReq.builder().collectionName(collection).build())
+                && client.getCollectionStats(GetCollectionStatsReq.builder().collectionName(collection).build())
+                        .getNumOfEntities() > 0;
+    }
 
     record ScoredDoc(String docId, String chunkId, double score, String text) {
     }
@@ -209,12 +218,18 @@ public class App {
         }
 
         public BM25Retriever(String endpoint) throws URISyntaxException {
-            List<TextSegment> chunks = loadAndChunkCorpus();
             this.client = new MilvusClientV2(ConnectConfig.builder()
                     .uri(endpoint)
                     .build());
 
             String collectionName = "scifact_bm25";
+            if (hasData(client, collectionName)) {
+                client.loadCollection(io.milvus.v2.service.collection.request.LoadCollectionReq.builder()
+                        .collectionName(collectionName).build());
+                System.out.println("Reusing existing collection: " + collectionName);
+                return;
+            }
+            List<TextSegment> chunks = loadAndChunkCorpus();
 
             // Перевірка та видалення, якщо колекція вже існувала
             if (client.hasCollection(io.milvus.v2.service.collection.request.HasCollectionReq.builder()
@@ -326,6 +341,7 @@ public class App {
                     .annsField("sparse")
                     .data(Collections.singletonList(new EmbeddedText(query)))
                     .limit(k * 10)
+                    .consistencyLevel(ConsistencyLevel.BOUNDED)
                     .outputFields(Arrays.asList("docId", "chunkId", "text"))
                     .build());
 
@@ -362,6 +378,8 @@ public class App {
         private final MilvusV2EmbeddingStore store;
 
         public MilvusHybridRrfRetriever(String endpoint) throws URISyntaxException {
+            boolean reuse = hasData(new MilvusClientV2(ConnectConfig.builder().uri(endpoint).build()),
+                    "scifact_hybrid");
 
             this.store = MilvusV2EmbeddingStore.builder()
                     .collectionName("scifact_hybrid")
@@ -377,13 +395,15 @@ public class App {
 
             this.embeddingModel = new BgeSmallEnV15QuantizedEmbeddingModel();
 
-            EmbeddingStoreIngestor.builder()
-                    .embeddingModel(embeddingModel)
-                    .documentSplitter(DocumentSplitters.recursive(300, 50, new HuggingFaceTokenCountEstimator()))
-                    .embeddingStore(store)
-                    .build()
-                    .ingest(loadParquetCorpus());
-            System.out.println("milvus rrf ranker inserted successfully");
+            if (!reuse) {
+                EmbeddingStoreIngestor.builder()
+                        .embeddingModel(embeddingModel)
+                        .documentSplitter(DocumentSplitters.recursive(300, 50, new HuggingFaceTokenCountEstimator()))
+                        .embeddingStore(store)
+                        .build()
+                        .ingest(loadParquetCorpus());
+            }
+            System.out.println("milvus rrf ranker ready");
         }
 
         @Override
@@ -423,11 +443,11 @@ public class App {
         private final MilvusV2EmbeddingStore embeddingStore;
 
         public DenseRetriever(String endpoint) throws URISyntaxException {
-            List<Document> documents = loadParquetCorpus();
             var client = new MilvusClientV2(ConnectConfig.builder()
                     .uri(endpoint)
                     .build());
-            if (client.hasCollection(HasCollectionReq.builder()
+            boolean reuse = hasData(client, "my_collection");
+            if (!reuse && client.hasCollection(HasCollectionReq.builder()
                     .collectionName("my_collection")
                     .build())) {
                 client.dropCollection(DropCollectionReq.builder()
@@ -448,7 +468,9 @@ public class App {
                     .embeddingModel(embeddingModel)
                     .documentSplitter(DocumentSplitters.recursive(300, 50, new HuggingFaceTokenCountEstimator()))
                     .embeddingStore(embeddingStore).build();
-            ingestor.ingest(documents);
+            if (!reuse) {
+                ingestor.ingest(loadParquetCorpus());
+            }
 
         }
 
@@ -672,8 +694,8 @@ public class App {
     }
 
     public static void main(String[] args) throws Exception {
-        milvus.start();
-        try {
+        milvus.start(); // reused container (see withReuse): not stopped, data survives between runs
+        {
             var train = loadLabeledQueries("train");
             var test = loadLabeledQueries("test");
 
@@ -695,9 +717,6 @@ public class App {
                 EvalReport report = evaluator.evaluate(retriever, test, 10, 100);
                 System.out.println(report);
             }
-        } finally {
-            milvus.stop();
-            milvus.close();
         }
     }
 
