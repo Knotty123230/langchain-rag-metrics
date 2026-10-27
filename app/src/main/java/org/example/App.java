@@ -46,6 +46,7 @@ import dev.langchain4j.store.embedding.milvus.v2.MilvusV2Ranker;
 import io.milvus.common.clientenum.FunctionType;
 import io.milvus.v2.client.ConnectConfig;
 import io.milvus.v2.client.MilvusClientV2;
+import io.milvus.v2.common.ConsistencyLevel;
 import io.milvus.v2.common.DataType;
 import io.milvus.v2.common.IndexParam;
 import io.milvus.v2.service.collection.request.AddFieldReq;
@@ -307,6 +308,7 @@ public class App {
             client.createCollection(CreateCollectionReq.builder()
                     .collectionName(COLLECTION_NAME)
                     .collectionSchema(schema)
+                    .consistencyLevel(ConsistencyLevel.STRONG)
                     .indexParams(Collections.singletonList(sparseIndex))
                     .build());
         }
@@ -323,7 +325,7 @@ public class App {
                     .collectionName(COLLECTION_NAME)
                     .annsField("sparse")
                     .data(Collections.singletonList(new EmbeddedText(query)))
-                    .topK(k * 10)
+                    .limit(k * 10)
                     .outputFields(Arrays.asList("docId", "chunkId", "text"))
                     .build());
 
@@ -614,10 +616,10 @@ public class App {
         }
     }
 
-    public static List<LabeledQuery> loadLabeledQueries() throws URISyntaxException {
+    public static List<LabeledQuery> loadLabeledQueries(String split) throws URISyntaxException {
         URL queriesResource = App.class.getClassLoader()
                 .getResource("dataset/scifact/queries/queries-00000-of-00001.parquet");
-        URL qrelsResource = App.class.getClassLoader().getResource("dataset/scifact/qrels/test.tsv");
+        URL qrelsResource = App.class.getClassLoader().getResource("dataset/scifact/qrels/" + split + ".tsv");
 
         if (queriesResource == null || qrelsResource == null) {
             throw new IllegalStateException("Required dataset files not found in resources!");
@@ -672,28 +674,63 @@ public class App {
     public static void main(String[] args) throws Exception {
         milvus.start();
         try {
-            var queries = loadLabeledQueries();
+            var train = loadLabeledQueries("train");
+            var test = loadLabeledQueries("test");
+
             RetrievalEvaluator evaluator = new SimpleRetrievalEvaluator();
 
             Retriever bm25 = new BM25Retriever(milvus.getEndpoint());
             Retriever dense = new DenseRetriever(milvus.getEndpoint());
+            int bestK = getBestKForHybrid(train, evaluator, bm25, dense);
+
+            System.out.println("bestK = " + bestK);
             List<Retriever> retrievers = List.of(
                     bm25,
                     dense,
-                    new RrfFusionRetriever(List.of(bm25, dense), 20, 100),
-                    new RrfFusionRetriever(List.of(bm25, dense), 60, 100),
-                    new RrfFusionRetriever(List.of(bm25, dense), 100, 100),
+                    new RrfFusionRetriever(List.of(bm25, dense), bestK, 100),
                     new MilvusHybridRrfRetriever(milvus.getEndpoint()));
 
             for (Retriever retriever : retrievers) {
-                warmup(retriever, queries.subList(0, 100), evaluator);
-                EvalReport report = evaluator.evaluate(retriever, queries, 10, 100);
+                warmup(retriever, train.subList(0, 100), evaluator);
+                EvalReport report = evaluator.evaluate(retriever, test, 10, 100);
                 System.out.println(report);
             }
         } finally {
             milvus.stop();
             milvus.close();
         }
+    }
+
+    private static int getBestKForHybrid(List<LabeledQuery> train, RetrievalEvaluator evaluator, Retriever bm25,
+            Retriever dense) {
+        int bestK = 0;
+        double bestNdcg = -1;
+        // bm25/dense results don't depend on rrfK: compute once per query, not once per
+        // k
+        Retriever cBm25 = cached(bm25);
+        Retriever cDense = cached(dense);
+        for (int k : new int[] { 5, 10, 20, 40, 60, 100 }) {
+            var r = new RrfFusionRetriever(List.of(cBm25, cDense), k, 100);
+            double ndcg = evaluator.evaluate(r, train, 10, 100).ndcgAt10();
+            if (ndcg > bestNdcg) {
+                bestNdcg = ndcg;
+                bestK = k;
+            }
+        }
+        return bestK;
+    }
+
+    private static Retriever cached(Retriever r) {
+        Map<String, List<ScoredDoc>> cache = new java.util.concurrent.ConcurrentHashMap<>();
+        return new Retriever() {
+            public String name() {
+                return r.name();
+            }
+
+            public List<ScoredDoc> retrieve(String query, int k) {
+                return cache.computeIfAbsent(query + "\0" + k, q -> r.retrieve(query, k));
+            }
+        };
     }
 
     public static void warmup(Retriever retriever, List<LabeledQuery> queries, RetrievalEvaluator evaluator) {
