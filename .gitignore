@@ -1,0 +1,20 @@
+# Ignore Gradle project-specific cache directory
+.gradle
+
+# Ignore Gradle build output directory
+build
+
+# Ignore Kotlin plugin data
+.kotlin
+.idea/compiler.xml
+.idea/gradle.xml
+.idea/misc.xml
+.idea/vcs.xml
+.vscode
+.idea
+volumes/milvus
+embedEtcd.yaml
+docker-compose.yaml
+user.yaml
+standalone_embed.sh
+gradlew.bat
